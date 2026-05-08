@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# environments
+venv/
+.venv/
+env/
+.env/
+
+# logs
+*.log
+logs/
+
+# caches (HuggingFace / torch / misc)
+.cache/
+huggingface/
+transformers_cache/
+
+# model weights (don’t commit these)
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+
+# benchmark / eval outputs
+benchmarks/output/
+benchmarks/results/
+evaluation/output/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+.idea/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# temp files
+*.tmp
+*.temp
