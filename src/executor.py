@@ -1,4 +1,4 @@
-from future import annotations
+from __future__ import annotations
 
 import asyncio import time from dataclasses import asdict from typing import Any
 

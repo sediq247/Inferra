@@ -1,4 +1,4 @@
-from future import annotations
+from __future__ import annotations
 
 import asyncio import random import time from dataclasses import dataclass
 

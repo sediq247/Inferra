@@ -1,125 +1,360 @@
-from future import annotations
+from __future__ import annotations
 
-import time from dataclasses import dataclass from typing import Optional
+import math
+import time
+from dataclasses import dataclass
 
-from config import settings from datamodels import OptimizerDecision, RuntimeMode from metrics import metrics from mode_switcher import mode_switcher from utils import MovingAverage, logger
+from config import settings
+from datamodels import (
+    OptimizerDecision,
+    RuntimeMode,
+)
+from mode_switcher import mode_switcher
+from utils import (
+    MovingAverage,
+    logger,
+)
 
-@dataclass(slots=True) class OptimizationState: avg_latency_ms: float = 0.0 queue_pressure: float = 0.0 tokens_per_second: float = 0.0
 
-class Optimizer: """ Core adaptive optimization brain.
+@dataclass(slots=True)
+class OptimizationState:
+    avg_latency_ms: float = 0.0
+    queue_pressure: float = 0.0
+    throughput_tokens_per_second: float = 0.0
+    pressure_score: float = 0.0
 
-Responsibilities:
-- Translate runtime metrics into execution parameters
-- Recommend batch size + token budget
-- Coordinate with mode_switcher
-"""
 
-def __init__(self) -> None:
-    self.latency_ma = MovingAverage(window_size=50)
-    self.tps_ma = MovingAverage(window_size=50)
-    self.queue_ma = MovingAverage(window_size=50)
+class Optimizer:
+    """
+    Adaptive optimization controller.
 
-    self.last_decision_time = time.time()
+    Responsibilities:
+    - dynamic batch scaling
+    - adaptive token budgeting
+    - runtime pressure analysis
+    - throughput/latency balancing
+    """
 
-    self.min_adjust_interval_s = (
-        settings.execution.optimizer_tick_s
-    )
+    def __init__(self) -> None:
+        self.latency_ma = MovingAverage(
+            window_size=50,
+        )
 
-    self.base_batch_size = settings.scheduler.max_batch_size
-    self.base_batch_tokens = settings.scheduler.max_batch_tokens
+        self.tps_ma = MovingAverage(
+            window_size=50,
+        )
 
-def observe(
-    self,
-    queue_size: int,
-    avg_latency_ms: float,
-    tokens_per_second: float,
-) -> None:
-    self.latency_ma.add(avg_latency_ms)
-    self.tps_ma.add(tokens_per_second)
-    self.queue_ma.add(float(queue_size))
+        self.queue_ma = MovingAverage(
+            window_size=50,
+        )
 
-def compute(self) -> OptimizerDecision:
-    now = time.time()
+        self.pressure_ma = MovingAverage(
+            window_size=50,
+        )
 
-    avg_latency = self.latency_ma.average
-    avg_tps = self.tps_ma.average
-    avg_queue = self.queue_ma.average
+        self.base_batch_size = (
+            settings.scheduler.max_batch_size
+        )
 
-    queue_pressure = (
-        avg_queue / max(self.base_batch_size, 1)
-    )
+        self.base_batch_tokens = (
+            settings.scheduler.max_batch_tokens
+        )
 
-    runtime_mode = mode_switcher.get_mode()
+        self.min_batch_size = 1
+        self.max_batch_size = (
+            self.base_batch_size * 4
+        )
 
-    # batch sizing logic
-    if runtime_mode == RuntimeMode.THROUGHPUT:
-        batch_multiplier = 1.5 + min(queue_pressure, 2.0)
-    else:
-        batch_multiplier = 1.0 - min(avg_latency / 2000.0, 0.5)
+        self.min_batch_tokens = 256
+        self.max_batch_tokens = (
+            self.base_batch_tokens * 4
+        )
 
-    recommended_batch_size = int(
-        max(1, self.base_batch_size * batch_multiplier)
-    )
+        self.last_decision_time = time.time()
 
-    # token budget scaling
-    if runtime_mode == RuntimeMode.THROUGHPUT:
-        token_multiplier = 1.5 + queue_pressure
-    else:
-        token_multiplier = 1.0
+        self.optimizer_tick_s = (
+            settings.execution.optimizer_tick_s
+        )
 
-    recommended_batch_tokens = int(
-        max(256, self.base_batch_tokens * token_multiplier)
-    )
+    # ---------------------------------------------------------
+    # Runtime Observation
+    # ---------------------------------------------------------
 
-    expected_latency_ms = avg_latency * (
-        1.0 if runtime_mode == RuntimeMode.LATENCY else 1.2
-    )
+    def observe(
+        self,
+        queue_size: int,
+        avg_latency_ms: float,
+        tokens_per_second: float,
+    ) -> None:
+        pressure_score = (
+            queue_size * avg_latency_ms
+        )
 
-    reason = self._explain(
-        runtime_mode,
-        queue_pressure,
-        avg_latency,
-        avg_tps,
-    )
+        self.queue_ma.add(
+            float(queue_size),
+        )
 
-    decision = OptimizerDecision(
-        runtime_mode=runtime_mode,
-        recommended_batch_size=recommended_batch_size,
-        recommended_batch_tokens=recommended_batch_tokens,
-        queue_pressure=queue_pressure,
-        expected_latency_ms=expected_latency_ms,
-        reason=reason,
-    )
+        self.latency_ma.add(
+            avg_latency_ms,
+        )
 
-    logger.info(
-        "optimizer_decision",
-        runtime_mode=runtime_mode.value,
-        batch_size=recommended_batch_size,
-        batch_tokens=recommended_batch_tokens,
-        queue_pressure=queue_pressure,
-        avg_latency_ms=avg_latency,
-    )
+        self.tps_ma.add(
+            tokens_per_second,
+        )
 
-    return decision
+        self.pressure_ma.add(
+            pressure_score,
+        )
 
-def _explain(
-    self,
-    mode: RuntimeMode,
-    queue_pressure: float,
-    avg_latency: float,
-    avg_tps: float,
-) -> str:
-    if mode == RuntimeMode.THROUGHPUT:
-        if queue_pressure > 1.5:
-            return "high_queue_pressure_throughput_mode"
-        return "throughput_mode_default"
+    # ---------------------------------------------------------
+    # Optimization Logic
+    # ---------------------------------------------------------
 
-    if avg_latency > 1000:
-        return "high_latency_latency_mode"
+    def compute(self) -> OptimizerDecision:
+        now = time.time()
 
-    if avg_tps < 10:
-        return "low_throughput_latency_mode"
+        if (
+            now - self.last_decision_time
+            < self.optimizer_tick_s
+        ):
+            runtime_mode = (
+                mode_switcher.get_mode()
+            )
 
-    return "balanced_latency_mode"
+            return OptimizerDecision(
+                runtime_mode=runtime_mode,
+                recommended_batch_size=(
+                    self.base_batch_size
+                ),
+                recommended_batch_tokens=(
+                    self.base_batch_tokens
+                ),
+                queue_pressure=0.0,
+                expected_latency_ms=(
+                    self.latency_ma.average
+                ),
+                reason="optimizer_tick_interval",
+            )
+
+        self.last_decision_time = now
+
+        avg_latency = max(
+            self.latency_ma.average,
+            1.0,
+        )
+
+        avg_tps = max(
+            self.tps_ma.average,
+            1.0,
+        )
+
+        avg_queue = max(
+            self.queue_ma.average,
+            0.0,
+        )
+
+        pressure_score = (
+            self.pressure_ma.average
+        )
+
+        queue_pressure = (
+            avg_queue
+            / max(self.base_batch_size, 1)
+        )
+
+        runtime_mode = (
+            mode_switcher.get_mode()
+        )
+
+        # ---------------------------------------------------------
+        # Dynamic scaling model
+        # ---------------------------------------------------------
+
+        throughput_factor = math.log1p(
+            avg_tps,
+        )
+
+        latency_penalty = min(
+            avg_latency / 2000.0,
+            2.0,
+        )
+
+        pressure_factor = min(
+            queue_pressure,
+            4.0,
+        )
+
+        if runtime_mode == RuntimeMode.THROUGHPUT:
+            batch_scale = (
+                1.0
+                + (pressure_factor * 0.8)
+                + (throughput_factor * 0.15)
+            )
+
+            token_scale = (
+                1.0
+                + (pressure_factor * 0.9)
+            )
+
+        else:
+            batch_scale = max(
+                0.5,
+                1.0 - (latency_penalty * 0.35),
+            )
+
+            token_scale = max(
+                0.75,
+                1.0 - (latency_penalty * 0.25),
+            )
+
+        recommended_batch_size = int(
+            min(
+                self.max_batch_size,
+                max(
+                    self.min_batch_size,
+                    round(
+                        self.base_batch_size
+                        * batch_scale,
+                    ),
+                ),
+            )
+        )
+
+        recommended_batch_tokens = int(
+            min(
+                self.max_batch_tokens,
+                max(
+                    self.min_batch_tokens,
+                    round(
+                        self.base_batch_tokens
+                        * token_scale,
+                    ),
+                ),
+            )
+        )
+
+        expected_latency_ms = (
+            avg_latency
+            * (
+                1.15
+                if runtime_mode
+                == RuntimeMode.THROUGHPUT
+                else 0.92
+            )
+        )
+
+        reason = self._explain(
+            runtime_mode=runtime_mode,
+            queue_pressure=queue_pressure,
+            pressure_score=pressure_score,
+            avg_latency=avg_latency,
+            avg_tps=avg_tps,
+        )
+
+        decision = OptimizerDecision(
+            runtime_mode=runtime_mode,
+            recommended_batch_size=(
+                recommended_batch_size
+            ),
+            recommended_batch_tokens=(
+                recommended_batch_tokens
+            ),
+            queue_pressure=queue_pressure,
+            expected_latency_ms=(
+                expected_latency_ms
+            ),
+            reason=reason,
+        )
+
+        logger.info(
+            "optimizer_decision",
+            runtime_mode=runtime_mode.value,
+            batch_size=recommended_batch_size,
+            batch_tokens=(
+                recommended_batch_tokens
+            ),
+            queue_pressure=round(
+                queue_pressure,
+                3,
+            ),
+            pressure_score=round(
+                pressure_score,
+                2,
+            ),
+            avg_latency_ms=round(
+                avg_latency,
+                2,
+            ),
+            avg_tokens_per_second=round(
+                avg_tps,
+                2,
+            ),
+        )
+
+        return decision
+
+    # ---------------------------------------------------------
+    # Adaptive Candidate Pool
+    # ---------------------------------------------------------
+
+    def dynamic_candidate_pool(
+        self,
+        queue_size: int,
+    ) -> int:
+        pressure = (
+            queue_size
+            / max(self.base_batch_size, 1)
+        )
+
+        scale = min(
+            max(1.0, pressure),
+            4.0,
+        )
+
+        return int(
+            self.base_batch_size * scale
+        )
+
+    # ---------------------------------------------------------
+    # Reasoning Layer
+    # ---------------------------------------------------------
+
+    def _explain(
+        self,
+        runtime_mode: RuntimeMode,
+        queue_pressure: float,
+        pressure_score: float,
+        avg_latency: float,
+        avg_tps: float,
+    ) -> str:
+        if runtime_mode == RuntimeMode.THROUGHPUT:
+            if pressure_score > 10000:
+                return (
+                    "extreme_runtime_pressure"
+                )
+
+            if queue_pressure > 2.0:
+                return (
+                    "queue_saturation_detected"
+                )
+
+            return (
+                "throughput_optimization_active"
+            )
+
+        if avg_latency > 1200:
+            return (
+                "latency_reduction_priority"
+            )
+
+        if avg_tps < 20:
+            return (
+                "low_throughput_recovery_mode"
+            )
+
+        return (
+            "balanced_runtime_mode"
+        )
+
 
 optimizer = Optimizer()
